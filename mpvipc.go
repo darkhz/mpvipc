@@ -16,11 +16,10 @@ type Connection struct {
 	client     net.Conn
 	socketName string
 
-	lastRequest     uint
-	waitingRequests map[uint]chan *commandResult
+	lastRequest     int64
+	waitingRequests map[int64]chan *commandResult
 
-	lastListener   uint
-	eventListeners map[uint]chan<- *Event
+	eventHub        *Hub
 
 	lastCloseWaiter uint
 	closeWaiters    map[uint]chan struct{}
@@ -49,13 +48,17 @@ type Event struct {
 	Text string `json:"text"`
 
 	// ID is the user-set property ID (on events triggered by observed properties)
-	ID uint `json:"id"`
+	ID int64 `json:"id"`
 
 	// Data is the property value (on events triggered by observed properties)
 	Data interface{} `json:"data"`
 
 	// ExtraData contains extra attributes of the event payload (on spontaneous events)
 	ExtraData map[string]interface{} `json:"-"`
+}
+
+type EventListener struct {
+	send chan<- *Event
 }
 
 var eventFieldNames = []string{}
@@ -97,8 +100,7 @@ func NewConnection(socketName string) *Connection {
 	return &Connection{
 		socketName:      socketName,
 		lock:            &sync.Mutex{},
-		waitingRequests: make(map[uint]chan *commandResult),
-		eventListeners:  make(map[uint]chan<- *Event),
+		waitingRequests: make(map[int64]chan *commandResult),
 		closeWaiters:    make(map[uint]chan struct{}),
 	}
 }
@@ -117,7 +119,9 @@ func (c *Connection) Open() error {
 	if err != nil {
 		return fmt.Errorf("can't connect to mpv's socket: %s", err)
 	}
-	c.client = client
+	c.client   = client
+	c.eventHub = newHub()
+	go c.eventHub.run()
 	go c.listen()
 	return nil
 }
@@ -129,18 +133,10 @@ func (c *Connection) Open() error {
 //
 // The events channel is closed automatically just before this method returns.
 func (c *Connection) ListenForEvents(events chan<- *Event, stop <-chan struct{}) {
-	c.lock.Lock()
-	c.lastListener++
-	id := c.lastListener
-	c.eventListeners[id] = events
-	c.lock.Unlock()
-
+	listener := &EventListener{send:events}
+	c.eventHub.register   <- listener
 	<-stop
-
-	c.lock.Lock()
-	delete(c.eventListeners, id)
-	close(events)
-	c.lock.Unlock()
+	c.eventHub.unregister <- listener
 }
 
 // NewEventListener is a convenience wrapper around ListenForEvents(). It
@@ -148,7 +144,7 @@ func (c *Connection) ListenForEvents(events chan<- *Event, stop <-chan struct{})
 // NewEventListener, read events from the events channel and send an empty
 // struct to the stop channel to close it.
 func (c *Connection) NewEventListener() (chan *Event, chan struct{}) {
-	events := make(chan *Event)
+	events := make(chan *Event, 256)
 	stop := make(chan struct{})
 	go c.ListenForEvents(events, stop)
 	return events, stop
@@ -251,7 +247,7 @@ func (c *Connection) WaitUntilClosed() {
 	c.lock.Unlock()
 }
 
-func (c *Connection) sendCommand(id uint, arguments ...interface{}) error {
+func (c *Connection) sendCommand(id int64, arguments ...interface{}) error {
 	if c.client == nil {
 		return fmt.Errorf("trying to send command on closed mpv client")
 	}
@@ -276,13 +272,13 @@ func (c *Connection) sendCommand(id uint, arguments ...interface{}) error {
 
 type commandRequest struct {
 	Arguments []interface{} `json:"command"`
-	ID        uint          `json:"request_id"`
+	ID        int64         `json:"request_id"`
 }
 
 type commandResult struct {
 	Status string      `json:"error"`
 	Data   interface{} `json:"data"`
-	ID     uint        `json:"request_id"`
+	ID     int64       `json:"request_id"`
 }
 
 func (c *Connection) checkResult(data []byte) {
@@ -311,14 +307,7 @@ func (c *Connection) checkEvent(data []byte) {
 	if event.Name == "" {
 		return // not an event
 	}
-	c.lock.Lock()
-	for listenerID := range c.eventListeners {
-		listener := c.eventListeners[listenerID]
-		go func() {
-			listener <- event
-		}()
-	}
-	c.lock.Unlock()
+	c.eventHub.broadcast <- event
 }
 
 func (c *Connection) listen() {
