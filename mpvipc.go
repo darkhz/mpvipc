@@ -4,11 +4,12 @@ package mpvipc
 
 import (
 	"bufio"
-	"encoding/json"
 	"fmt"
 	"net"
 	"reflect"
 	"sync"
+
+	"github.com/ugorji/go/codec"
 )
 
 // Connection represents a connection to a mpv IPC socket
@@ -25,6 +26,13 @@ type Connection struct {
 	closeWaiters    map[uint]chan struct{}
 
 	lock *sync.Mutex
+}
+
+type Parser struct {
+	decoder *codec.Decoder
+	encoder *codec.Encoder
+
+	enc sync.Mutex
 }
 
 // Event represents an event received from mpv. For a list of all possible
@@ -62,6 +70,7 @@ type EventListener struct {
 }
 
 var eventFieldNames = []string{}
+var parser *Parser
 
 func init() {
 	// collect all named fields into a global
@@ -78,12 +87,12 @@ func (e *Event) UnmarshalJSON(data []byte) error {
 	type Proxy Event
 
 	// unmarshal named fields
-	if err := json.Unmarshal(data, (*Proxy)(e)); err != nil {
+	if err := parser.Decode(data, (*Proxy)(e)); err != nil {
 		return err
 	}
 
 	// unmarshal unnamed fields into our container
-	if err := json.Unmarshal(data, &e.ExtraData); err != nil {
+	if err := parser.Decode(data, &e.ExtraData); err != nil {
 		return err
 	}
 
@@ -95,8 +104,31 @@ func (e *Event) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+func (e *Event) MarshalJSON() ([]byte, error) {
+	return parser.Encode(&e)
+}
+
+func (p *Parser) Encode(value interface{}) ([]byte, error) {
+	parser.enc.Lock()
+	defer parser.enc.Unlock()
+
+	var data []byte
+
+	parser.encoder.ResetBytes(&data)
+	return data, parser.encoder.Encode(value)
+}
+
+func (p *Parser) Decode(data []byte, value interface{}) error {
+	parser.decoder.ResetBytes(data)
+	return parser.decoder.Decode(value)
+}
+
 // NewConnection returns a Connection associated with the given unix socket
 func NewConnection(socketName string) *Connection {
+	parser = &Parser{
+		decoder: codec.NewDecoderBytes(nil, &codec.JsonHandle{}),
+		encoder: codec.NewEncoderBytes(nil, &codec.JsonHandle{}),
+	}
 	return &Connection{
 		socketName:      socketName,
 		lock:            &sync.Mutex{},
@@ -255,7 +287,8 @@ func (c *Connection) sendCommand(id int64, arguments ...interface{}) error {
 		Arguments: arguments,
 		ID:        id,
 	}
-	data, err := json.Marshal(&message)
+
+	data, err := parser.Encode(&message)
 	if err != nil {
 		return fmt.Errorf("can't encode command: %s", err)
 	}
@@ -267,6 +300,7 @@ func (c *Connection) sendCommand(id int64, arguments ...interface{}) error {
 	if err != nil {
 		return fmt.Errorf("can't terminate command: %s", err)
 	}
+
 	return err
 }
 
@@ -283,7 +317,8 @@ type commandResult struct {
 
 func (c *Connection) checkResult(data []byte) {
 	result := &commandResult{}
-	err := json.Unmarshal(data, &result)
+
+	err := parser.Decode(data, &result)
 	if err != nil {
 		return // skip malformed data
 	}
@@ -300,7 +335,8 @@ func (c *Connection) checkResult(data []byte) {
 
 func (c *Connection) checkEvent(data []byte) {
 	event := &Event{}
-	err := json.Unmarshal(data, &event)
+
+	err := parser.Decode(data, &event)
 	if err != nil {
 		return // skip malformed data
 	}
